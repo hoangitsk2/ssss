@@ -124,10 +124,6 @@ class MusicPlayer:
                 path = self._resolve_saved_path(line.strip())
                 if path:
                     playlist.append(path)
-        if MUSIC_DIR.exists():
-            for path in sorted(MUSIC_DIR.iterdir()):
-                if path.suffix.lower() in SUPPORTED_EXTENSIONS and path not in playlist:
-                    playlist.append(path)
         return playlist
 
     def save_playlist(self) -> None:
