@@ -3,6 +3,7 @@ Tkinter + pygame music player for Raspberry Pi with 15-minute shutdown.
 """
 from __future__ import annotations
 
+import io
 import os
 import platform
 import random
@@ -17,6 +18,9 @@ import pygame
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from mutagen import File as MutagenFile
+from PIL import Image, ImageDraw, ImageTk
+
 
 SESSION_LIMIT_SECONDS = 15 * 60
 DEFAULT_VOLUME = 0.7
@@ -30,12 +34,15 @@ class MusicPlayer:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Pi Music Player")
-        self.root.geometry("720x420")
+        self.root.geometry("880x470")
         self.root.configure(bg="#0f172a")
         self.root.resizable(False, False)
 
         self.session_start = time.monotonic()
         self.session_limit = SESSION_LIMIT_SECONDS
+        self.shutdown_paused = False
+        self.shutdown_paused_at: Optional[float] = None
+        self.shutdown_paused_total = 0.0
 
         self.playlist_names = self._ensure_playlists()
         self.current_playlist_name = self.playlist_names[0]
@@ -50,6 +57,11 @@ class MusicPlayer:
         )
         self.dry_run_shutdown = os.environ.get("DRY_RUN_SHUTDOWN") == "1"
 
+        self.rotation_angle = 0
+        self.disc_base_image = self._create_default_disc_image()
+        self.current_disc_photo: Optional[ImageTk.PhotoImage] = None
+        self.disc_canvas_image: Optional[int] = None
+
         pygame.mixer.init()
 
         self._build_ui()
@@ -59,6 +71,7 @@ class MusicPlayer:
         self.auto_start_playback()
         self.root.after(500, self._monitor_playback)
         self.root.after(500, self._update_time_labels)
+        self.root.after(80, self._rotate_disc)
 
     def refresh_playlist_box(self) -> None:
         self.playlist_box.delete(0, tk.END)
@@ -110,10 +123,6 @@ class MusicPlayer:
             for line in target_file.read_text(encoding="utf-8").splitlines():
                 path = self._resolve_saved_path(line.strip())
                 if path:
-                    playlist.append(path)
-        if MUSIC_DIR.exists():
-            for path in sorted(MUSIC_DIR.iterdir()):
-                if path.suffix.lower() in SUPPORTED_EXTENSIONS and path not in playlist:
                     playlist.append(path)
         return playlist
 
@@ -181,6 +190,30 @@ class MusicPlayer:
         self.playlist_names = sorted(set(self.playlist_names))
         self.switch_playlist(sanitized)
 
+    def delete_playlist(self) -> None:
+        if len(self.playlist_names) <= 1:
+            messagebox.showinfo("Cannot delete", "Cần ít nhất một playlist để phát.")
+            return
+        if not messagebox.askyesno(
+            "Delete playlist", f"Xoá playlist '{self.current_playlist_name}'?"
+        ):
+            return
+        target = self.playlist_path(self.current_playlist_name)
+        try:
+            if target.exists():
+                target.unlink()
+        except OSError as exc:
+            messagebox.showerror("Cannot delete", f"Không xoá được file: {exc}")
+            return
+        self.playlist_names = [n for n in self.playlist_names if n != self.current_playlist_name]
+        self.current_playlist_name = self.playlist_names[0]
+        self.playlist = self.load_playlist(self.current_playlist_name)
+        self.current_index = 0 if self.playlist else None
+        self.refresh_playlist_box()
+        self.play() if self.playlist else self.track_label.config(
+            text="Playlist is empty. Add music."
+        )
+
     def _build_ui(self) -> None:
         self.bg_canvas = tk.Canvas(self.root, highlightthickness=0, borderwidth=0)
         self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
@@ -237,6 +270,12 @@ class MusicPlayer:
             text="Playlist",
             font=("Segoe UI", 11, "bold"),
         ).pack(side=tk.LEFT, pady=(0, 6))
+        ttk.Button(
+            header_row,
+            text="Delete playlist",
+            style="Secondary.TButton",
+            command=self.delete_playlist,
+        ).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(
             header_row,
             text="New playlist",
@@ -296,6 +335,13 @@ class MusicPlayer:
             command=self.play_random_track,
         ).pack(side=tk.LEFT)
 
+        ttk.Button(
+            actions,
+            text="Remove selected",
+            style="Secondary.TButton",
+            command=self.remove_selected_track,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
         # Now playing + controls column
         right_col = ttk.Frame(content)
         right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -320,6 +366,25 @@ class MusicPlayer:
             font=("Segoe UI", 10, "bold"),
         )
         self.session_label.pack(pady=(0, 8))
+
+        self.shutdown_button = ttk.Button(
+            right_col,
+            text="Pause auto shutdown",
+            style="Secondary.TButton",
+            command=self.toggle_shutdown_pause,
+        )
+        self.shutdown_button.pack(pady=(0, 12))
+
+        self.disc_canvas = tk.Canvas(
+            right_col,
+            width=200,
+            height=200,
+            bg="#0f172a",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.disc_canvas.pack(pady=(0, 12))
+        self._update_disc_canvas(self.disc_base_image)
 
         slider_frame = ttk.Frame(right_col)
         slider_frame.pack(fill=tk.X, pady=10)
@@ -413,6 +478,7 @@ class MusicPlayer:
 
         track = self.playlist[self.current_index]
         try:
+            self._load_album_art(track)
             pygame.mixer.music.load(track)
             pygame.mixer.music.play()
             self.playing = True
@@ -489,6 +555,35 @@ class MusicPlayer:
         if added_any or self.playlist:
             self.play()
 
+    def remove_selected_track(self) -> None:
+        if not self.playlist:
+            messagebox.showinfo("Playlist trống", "Không có bài để xoá.")
+            return
+        selection = self.playlist_box.curselection()
+        if not selection:
+            messagebox.showinfo("Chọn bài", "Hãy chọn bài cần xoá khỏi playlist.")
+            return
+        idx = selection[0]
+        removed_track = self.playlist[idx]
+        del self.playlist[idx]
+        if self.current_index is not None:
+            if idx == self.current_index:
+                self.stop()
+                self.current_index = None if not self.playlist else min(idx, len(self.playlist) - 1)
+            elif idx < self.current_index:
+                self.current_index -= 1
+        if self.playlist and self.current_index is None:
+            self.current_index = 0
+        self.save_playlist()
+        self.refresh_playlist_box()
+        if not self.playlist:
+            self.track_label.config(text="Playlist is empty. Add music.")
+        elif self.current_index is not None:
+            self.track_label.config(
+                text=f"Ready: {self.formatted_track_name(self.playlist[self.current_index])}"
+            )
+        messagebox.showinfo("Đã xoá", f"Đã xoá {removed_track.name} khỏi playlist.")
+
     def _copy_into_music_dir(self, source: Path) -> Optional[Path]:
         try:
             MUSIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -528,13 +623,116 @@ class MusicPlayer:
             self.current_index = selection[0]
             self.play()
 
+    def toggle_shutdown_pause(self) -> None:
+        if self.shutdown_paused:
+            self.shutdown_paused = False
+            if self.shutdown_paused_at is not None:
+                self.shutdown_paused_total += time.monotonic() - self.shutdown_paused_at
+            self.shutdown_paused_at = None
+            self.shutdown_button.config(text="Pause auto shutdown")
+        else:
+            self.shutdown_paused = True
+            self.shutdown_paused_at = time.monotonic()
+            self.shutdown_button.config(text="Resume auto shutdown")
+
+    def _session_elapsed_seconds(self) -> float:
+        elapsed = time.monotonic() - self.session_start
+        paused = self.shutdown_paused_total
+        if self.shutdown_paused and self.shutdown_paused_at is not None:
+            paused += time.monotonic() - self.shutdown_paused_at
+        return max(0.0, elapsed - paused)
+
+    def _rotate_disc(self) -> None:
+        if self.disc_canvas and self.disc_base_image:
+            if self.playing and not self.paused:
+                self.rotation_angle = (self.rotation_angle + 3) % 360
+                rotated = self.disc_base_image.rotate(
+                    self.rotation_angle, resample=Image.BICUBIC
+                )
+                self._update_disc_canvas(rotated)
+        self.root.after(80, self._rotate_disc)
+
+    def _update_disc_canvas(self, image: Image.Image) -> None:
+        if not hasattr(self, "disc_canvas"):
+            return
+        self.current_disc_photo = ImageTk.PhotoImage(image)
+        if self.disc_canvas_image is None:
+            self.disc_canvas_image = self.disc_canvas.create_image(
+                100, 100, image=self.current_disc_photo
+            )
+        else:
+            self.disc_canvas.itemconfig(self.disc_canvas_image, image=self.current_disc_photo)
+
+    def _create_default_disc_image(self) -> Image.Image:
+        size = 200
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        center = size // 2
+        draw.ellipse((0, 0, size, size), fill="#1f2937")
+        draw.ellipse((10, 10, size - 10, size - 10), outline="#334155", width=8)
+        draw.ellipse((30, 30, size - 30, size - 30), fill="#0ea5e9")
+        draw.ellipse((72, 72, size - 72, size - 72), fill="#0f172a")
+        draw.ellipse((center - 6, center - 6, center + 6, center + 6), fill="#e5e7eb")
+        return img
+
+    def _build_disc_with_album(self, cover: Image.Image) -> Image.Image:
+        disc = self._create_default_disc_image()
+        cover_size = 120
+        square_cover = cover.copy()
+        square_cover.thumbnail((cover_size, cover_size))
+        # Ensure square crop
+        min_side = min(square_cover.size)
+        left = (square_cover.width - min_side) // 2
+        top = (square_cover.height - min_side) // 2
+        square_cover = square_cover.crop((left, top, left + min_side, top + min_side))
+        square_cover = square_cover.resize((cover_size, cover_size))
+
+        mask = Image.new("L", (cover_size, cover_size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, cover_size, cover_size), fill=255)
+
+        disc.paste(square_cover, (40, 40), mask)
+        return disc
+
+    def _extract_album_art(self, track: Path) -> Optional[Image.Image]:
+        try:
+            audio = MutagenFile(track)
+        except Exception:  # pylint: disable=broad-except
+            return None
+        if audio is None or getattr(audio, "tags", None) is None:
+            return None
+        image_data = None
+        if hasattr(audio, "pictures") and audio.pictures:
+            image_data = audio.pictures[0].data
+        elif "APIC:" in audio.tags:
+            image_data = audio.tags["APIC:"].data
+        else:
+            for tag in audio.tags.values():
+                if getattr(tag, "FrameID", "") == "APIC" and hasattr(tag, "data"):
+                    image_data = tag.data
+                    break
+        if not image_data:
+            return None
+        try:
+            return Image.open(io.BytesIO(image_data)).convert("RGBA")
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    def _load_album_art(self, track: Path) -> None:
+        art = self._extract_album_art(track)
+        if art is None:
+            self.disc_base_image = self._create_default_disc_image()
+        else:
+            self.disc_base_image = self._build_disc_with_album(art)
+        self.rotation_angle = 0
+        self._update_disc_canvas(self.disc_base_image)
+
     def _monitor_playback(self) -> None:
         if self.playing and not self.paused and not pygame.mixer.music.get_busy():
             self._on_track_end()
         self.root.after(500, self._monitor_playback)
 
     def _on_track_end(self) -> None:
-        elapsed = time.monotonic() - self.session_start
+        elapsed = self._session_elapsed_seconds()
         remaining = self.session_limit - elapsed
         if remaining <= 0:
             self._shutdown()
@@ -560,12 +758,11 @@ class MusicPlayer:
             self.progress_label.config(text="Not playing")
 
         # Session remaining
-        elapsed_session = time.monotonic() - self.session_start
+        elapsed_session = self._session_elapsed_seconds()
         remaining = max(0, int(self.session_limit - elapsed_session))
         rem_minutes, rem_seconds = divmod(remaining, 60)
-        self.session_label.config(
-            text=f"{rem_minutes:02d}:{rem_seconds:02d} remaining (auto shutdown)",
-        )
+        suffix = "paused" if self.shutdown_paused else "remaining (auto shutdown)"
+        self.session_label.config(text=f"{rem_minutes:02d}:{rem_seconds:02d} {suffix}")
         if remaining <= 0:
             self._shutdown()
             return
